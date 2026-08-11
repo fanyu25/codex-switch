@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# Manage isolated Codex authentication/configuration profiles.
+set -euo pipefail
+
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+STATE_DIR="${CODEX_SWITCH_HOME:-$HOME/.codex-switch}"
+PROFILES_DIR="$STATE_DIR/profiles"
+BACKUPS_DIR="$STATE_DIR/backups"
+LOCK_FILE="$STATE_DIR/.lock"
+PROVIDER_SYNC_BIN="${CODEX_PROVIDER_SYNC_BIN:-$HOME/.local/opt/codex-provider-sync/node_modules/.bin/codex-provider}"
+DEFAULT_OPENAI_BASE_URL="${CODEX_DEFAULT_OPENAI_BASE_URL:-https://api.openai.com/v1}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-switch list
+  codex-switch status
+  codex-switch save <profile>
+  codex-switch use <profile> [--resume [SESSION_ID]] [--no-reload-vscode]
+  codex-switch login <profile> [--clean] [--no-reload-vscode]
+  codex-switch api <profile> [--url API_BASE_URL] [--key-env ENV_VAR] [--no-reload-vscode]
+  codex-switch resume [SESSION_ID|--last] [PROMPT]
+
+Profiles can share Codex sessions only when their normalized API base URLs are
+identical. A different, missing, or invalid URL is rejected before auth.json or
+config.toml is changed.
+EOF
+}
+
+die() { printf 'codex-switch: %s\n' "$*" >&2; exit 1; }
+
+require_codex() { command -v codex >/dev/null 2>&1 || die "codex is not installed or not on PATH"; }
+
+validate_profile() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "profile must contain only letters, digits, dot, underscore, or hyphen"
+}
+
+profile_dir() { printf '%s/%s\n' "$PROFILES_DIR" "$1"; }
+
+copy_private() {
+  local source="$1" destination="$2" temp
+  temp="$(mktemp "${destination}.tmp.XXXXXX")"
+  install -m 600 "$source" "$temp"
+  mv -f "$temp" "$destination"
+}
+
+auth_mode() {
+  local auth_file="$1"
+  [[ -f "$auth_file" ]] || { printf 'none\n'; return; }
+  awk -F'"' '/"auth_mode"[[:space:]]*:/ { print $4; exit }' "$auth_file"
+}
+
+active_provider_id() {
+  local config="$1"
+  [[ -f "$config" ]] || return 0
+  awk -F= '
+    /^[[:space:]]*\[/ { exit }
+    /^[[:space:]]*model_provider[[:space:]]*=/ {
+      value=$2
+      gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$config"
+}
+
+# Extract base_url only from the active model provider section.
+provider_base_url() {
+  local config="$1" provider="$2"
+  [[ -f "$config" && -n "$provider" ]] || return 0
+  awk -v provider="$provider" -F= '
+    $0 == "[model_providers." provider "]" { inside=1; next }
+    inside && /^\[/ { exit }
+    inside && /^[[:space:]]*base_url[[:space:]]*=/ {
+      value=$2
+      gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$config"
+}
+
+# Lowercase scheme/authority and ignore query, fragment, and trailing slashes.
+normalize_base_url() {
+  local raw="$1" scheme authority path
+  [[ "$raw" =~ ^([Hh][Tt][Tt][Pp][Ss]?)://([^/?#]+)(/[^?#]*)?([?#].*)?$ ]] || return 1
+  scheme="${BASH_REMATCH[1],,}"
+  authority="${BASH_REMATCH[2],,}"
+  path="${BASH_REMATCH[3]:-}"
+  while [[ "$path" == */ && "$path" != "/" ]]; do path="${path%/}"; done
+  printf '%s://%s%s\n' "$scheme" "$authority" "$path"
+}
+
+service_url_for_paths() {
+  local config="$1" auth="$2" provider raw
+  if [[ -f "$config" ]]; then
+    provider="$(active_provider_id "$config")"
+    raw="$(provider_base_url "$config" "$provider")"
+    if [[ -n "$raw" ]]; then
+      normalize_base_url "$raw"
+      return
+    fi
+  fi
+  # A ChatGPT profile without an explicit provider URL uses the configured default.
+  [[ "$(auth_mode "$auth")" == "chatgpt" ]] || return 1
+  normalize_base_url "$DEFAULT_OPENAI_BASE_URL"
+}
+
+url_fingerprint() {
+  printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 12)}'
+}
+
+assert_matching_service_urls() {
+  local current_config="$1" current_auth="$2" target_config="$3" target_auth="$4"
+  local current_url target_url
+  current_url="$(service_url_for_paths "$current_config" "$current_auth")" \
+    || die "active service URL is missing or invalid; switch cancelled without changes"
+  target_url="$(service_url_for_paths "$target_config" "$target_auth")" \
+    || die "target service URL is missing or invalid; switch cancelled without changes"
+  [[ "$current_url" == "$target_url" ]] || die "service URLs differ (active=$(url_fingerprint "$current_url"), target=$(url_fingerprint "$target_url")); switch cancelled without changes"
+}
+
+assert_current_matches_default_openai_url() {
+  local current_url default_url
+  current_url="$(service_url_for_paths "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json")" \
+    || die "active service URL is missing or invalid; switch cancelled without changes"
+  default_url="$(normalize_base_url "$DEFAULT_OPENAI_BASE_URL")" \
+    || die "CODEX_DEFAULT_OPENAI_BASE_URL is invalid"
+  [[ "$current_url" == "$default_url" ]] || die "service URLs differ (active=$(url_fingerprint "$current_url"), target=$(url_fingerprint "$default_url")); switch cancelled without changes"
+}
+
+reload_vscode() {
+  local command_uri="vscode://command/workbench.action.reloadWindow"
+  pgrep -x code >/dev/null 2>&1 || return 0
+  command -v xdg-open >/dev/null 2>&1 || { printf 'Profile changed. VS Code was not reloaded because xdg-open is unavailable.\n' >&2; return 0; }
+  if xdg-open "$command_uri" >/dev/null 2>&1; then
+    printf 'Requested VS Code window reload so Codex uses the active profile.\n'
+  else
+    printf 'Profile changed, but VS Code could not be reloaded automatically.\n' >&2
+  fi
+}
+
+reload_vscode_if_requested() {
+  if [[ "$1" == true ]]; then
+    reload_vscode
+  fi
+  return 0
+}
+
+resolve_provider_sync_bin() {
+  [[ -x "$PROVIDER_SYNC_BIN" ]] && { printf '%s\n' "$PROVIDER_SYNC_BIN"; return; }
+  command -v codex-provider 2>/dev/null || true
+}
+
+sync_shared_history() {
+  local provider sync_bin
+  provider="$(active_provider_id "$CODEX_HOME_DIR/config.toml")"
+  [[ -n "$provider" ]] || provider="openai"
+  sync_bin="$(resolve_provider_sync_bin)"
+  [[ -n "$sync_bin" ]] || die "codex-provider-sync is not installed"
+  printf "Synchronizing shared Codex history to provider '%s'...\n" "$provider"
+  "$sync_bin" sync --provider "$provider" --codex-home "$CODEX_HOME_DIR"
+}
+
+backup_active() {
+  local backup="$BACKUPS_DIR/$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p -m 700 "$backup"
+  [[ -f "$CODEX_HOME_DIR/config.toml" ]] && install -m 600 "$CODEX_HOME_DIR/config.toml" "$backup/config.toml"
+  [[ -f "$CODEX_HOME_DIR/auth.json" ]] && install -m 600 "$CODEX_HOME_DIR/auth.json" "$backup/auth.json"
+  printf '%s\n' "$backup"
+}
+
+restore_active() {
+  local backup="$1"
+  if [[ -f "$backup/config.toml" ]]; then copy_private "$backup/config.toml" "$CODEX_HOME_DIR/config.toml"; else rm -f "$CODEX_HOME_DIR/config.toml"; fi
+  if [[ -f "$backup/auth.json" ]]; then copy_private "$backup/auth.json" "$CODEX_HOME_DIR/auth.json"; else rm -f "$CODEX_HOME_DIR/auth.json"; fi
+}
+
+sync_or_restore() {
+  local backup="$1"
+  if sync_shared_history; then return 0; fi
+  restore_active "$backup"
+  die "shared-history synchronization failed; restored the previous authentication and configuration from $backup"
+}
+
+save_profile() {
+  local name="$1" profile
+  validate_profile "$name"
+  profile="$(profile_dir "$name")"
+  mkdir -p -m 700 "$profile"
+  [[ -f "$CODEX_HOME_DIR/config.toml" ]] && copy_private "$CODEX_HOME_DIR/config.toml" "$profile/config.toml" || rm -f "$profile/config.toml"
+  [[ -f "$CODEX_HOME_DIR/auth.json" ]] && copy_private "$CODEX_HOME_DIR/auth.json" "$profile/auth.json" || rm -f "$profile/auth.json"
+  [[ -f "$profile/auth.json" ]] || die "no active auth.json was found; login first"
+}
+
+use_profile() {
+  local name="$1" profile backup
+  validate_profile "$name"
+  profile="$(profile_dir "$name")"
+  [[ -d "$profile" && -f "$profile/auth.json" ]] || die "profile '$name' does not exist or has no auth.json"
+  # This guard runs before the backup and any destination write.
+  assert_matching_service_urls "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json" "$profile/config.toml" "$profile/auth.json"
+  persist_active_profile_config
+  backup="$(backup_active)"
+  if [[ -f "$profile/config.toml" ]]; then copy_private "$profile/config.toml" "$CODEX_HOME_DIR/config.toml"; else rm -f "$CODEX_HOME_DIR/config.toml"; fi
+  copy_private "$profile/auth.json" "$CODEX_HOME_DIR/auth.json"
+  sync_or_restore "$backup"
+  printf "Activated '%s' (previous state: %s).\n" "$name" "$backup"
+}
+
+shared_session_count() {
+  local sessions_dir="$CODEX_HOME_DIR/sessions"
+  [[ -d "$sessions_dir" ]] || { printf '0\n'; return; }
+  find "$sessions_dir" -type f -name '*.jsonl' -print 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+configs_match() {
+  local active_config="$1" profile_config="$2"
+  if [[ -f "$profile_config" ]]; then [[ -f "$active_config" ]] && cmp -s "$active_config" "$profile_config"; else [[ ! -f "$active_config" ]]; fi
+}
+
+active_profile_status() {
+  local profile name active_auth="$CODEX_HOME_DIR/auth.json" active_config="$CODEX_HOME_DIR/config.toml"
+  local -a exact_matches=() credential_matches=()
+  [[ -f "$active_auth" ]] || { printf 'none\n'; return; }
+  for profile in "$PROFILES_DIR"/*; do
+    [[ -d "$profile" && -f "$profile/auth.json" ]] || continue
+    cmp -s "$active_auth" "$profile/auth.json" || continue
+    name="${profile##*/}"
+    if configs_match "$active_config" "$profile/config.toml"; then exact_matches+=("$name"); else credential_matches+=("$name"); fi
+  done
+  if [[ ${#exact_matches[@]} -gt 0 ]]; then (IFS=', '; printf '%s\n' "${exact_matches[*]}")
+  elif [[ ${#credential_matches[@]} -gt 0 ]]; then (IFS=', '; printf '%s (credentials match; config modified)\n' "${credential_matches[*]}")
+  else printf 'untracked\n'; fi
+}
+
+persist_active_profile_config() {
+  local active_auth="$CODEX_HOME_DIR/auth.json" profile
+  local -a matches=()
+  [[ -f "$active_auth" ]] || return 0
+  for profile in "$PROFILES_DIR"/*; do
+    [[ -d "$profile" && -f "$profile/auth.json" ]] || continue
+    cmp -s "$active_auth" "$profile/auth.json" || continue
+    matches+=("${profile##*/}")
+  done
+  case "${#matches[@]}" in
+    0) return 0 ;;
+    1)
+      profile="$(profile_dir "${matches[0]}")"
+      if [[ -f "$CODEX_HOME_DIR/config.toml" ]]; then
+        copy_private "$CODEX_HOME_DIR/config.toml" "$profile/config.toml"
+      else
+        rm -f "$profile/config.toml"
+      fi
+      ;;
+    *)
+      (IFS=', '; die "active credentials match multiple profiles (${matches[*]}); run save <profile> to disambiguate")
+      ;;
+  esac
+}
+
+resume_shared_session() {
+  local session_id="${1:-}" prompt="${2:-}"
+  local -a args=(--all)
+  require_codex
+  [[ "$session_id" == --last ]] && args+=(--last)
+  [[ -n "$session_id" && "$session_id" != --last ]] && args+=("$session_id")
+  [[ -n "$prompt" ]] && args+=("$prompt")
+  codex resume "${args[@]}"
+}
+
+stage_profile_config() {
+  local name="$1" profile
+  profile="$(profile_dir "$name")"
+  [[ -d "$profile" ]] || return
+  if [[ -f "$profile/config.toml" ]]; then copy_private "$profile/config.toml" "$CODEX_HOME_DIR/config.toml"; else rm -f "$CODEX_HOME_DIR/config.toml"; fi
+}
+
+login_account() {
+  local name="$1" clean="$2" backup
+  validate_profile "$name"
+  # ChatGPT login uses the default URL; validate it before changing active files.
+  assert_current_matches_default_openai_url
+  persist_active_profile_config
+  backup="$(backup_active)"
+  # Do not inherit a previous profile's provider block into a ChatGPT login.
+  rm -f "$CODEX_HOME_DIR/config.toml"
+  rm -f "$CODEX_HOME_DIR/auth.json"
+  if codex login; then
+    save_profile "$name"
+    sync_or_restore "$backup"
+    printf "Saved and activated account profile '%s'.\n" "$name"
+  else
+    restore_active "$backup"
+    die "login failed; restored the previous state from $backup"
+  fi
+}
+
+extract_provider_tuning() {
+  local source="$1" provider="$2" destination="$3"
+  awk -v provider="$provider" '
+    $0 == "[model_providers." provider "]" { inside=1; next }
+    inside && /^\[/ { exit }
+    inside && /^[[:space:]]*(wire_api|supports_websockets|request_max_retries|stream_max_retries|stream_idle_timeout_ms|supports_standalone_web_search)[[:space:]]*=/ { print }
+  ' "$source" > "$destination"
+}
+
+write_api_config() {
+  local base_url="$1" source="$CODEX_HOME_DIR/config.toml" provider temp tuning
+  provider="$(active_provider_id "$source")"; [[ -n "$provider" ]] || provider="openai"
+  temp="$(mktemp "$CODEX_HOME_DIR/.config.toml.api.XXXXXX")"
+  tuning="$(mktemp "$CODEX_HOME_DIR/.config.toml.tuning.XXXXXX")"
+  chmod 600 "$temp"
+  [[ -f "$source" ]] && extract_provider_tuning "$source" "$provider" "$tuning"
+  {
+    printf '# Managed by codex-switch. The API key is stored in auth.json.\n'
+    printf 'model_provider = "codex-switch-api"\n'
+    [[ -f "$source" ]] && awk -v provider="$provider" '
+      BEGIN { in_root = 1 }
+      function target_header(line, prefix) { prefix = "[model_providers." provider; return index(line, prefix) == 1 && (substr(line, length(prefix) + 1, 1) == "]" || substr(line, length(prefix) + 1, 1) == ".") }
+      /^\[/ { in_root = 0; if (target_header($0)) { skip = 1; next }; skip = 0 }
+      in_root && /^[[:space:]]*model_provider[[:space:]]*=/ { next }
+      !skip { print }
+    ' "$source"
+    printf '\n[model_providers.codex-switch-api]\nname = "Codex Switch API"\nbase_url = "%s"\nrequires_openai_auth = true\n' "$base_url"
+    if [[ -s "$tuning" ]]; then sed -n 'p' "$tuning"; else printf 'wire_api = "responses"\nsupports_websockets = false\nrequest_max_retries = 8\nstream_max_retries = 10\nstream_idle_timeout_ms = 300000\n'; fi
+  } > "$temp"
+  rm -f "$tuning"
+  mv -f "$temp" "$CODEX_HOME_DIR/config.toml"
+}
+
+login_api() {
+  local name="$1"; shift
+  local key_env="" key="" base_url="" backup current_url target_url
+  validate_profile "$name"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) [[ -n "${2:-}" ]] || die "--url requires an API base URL"; base_url="$2"; shift 2 ;;
+      --key-env) [[ -n "${2:-}" ]] || die "--key-env requires an environment-variable name"; key_env="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$base_url" ]] || read -r -p "API base URL (for example https://api.openai.com/v1): " base_url
+  target_url="$(normalize_base_url "$base_url")" || die "API base URL is invalid; switch cancelled without changes"
+  current_url="$(service_url_for_paths "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json")" || die "active service URL is missing or invalid; switch cancelled without changes"
+  [[ "$current_url" == "$target_url" ]] || die "service URLs differ (active=$(url_fingerprint "$current_url"), target=$(url_fingerprint "$target_url")); switch cancelled without changes"
+  persist_active_profile_config
+  [[ -n "$key_env" ]] && key="${!key_env:-}"
+  if [[ -z "$key" ]]; then read -r -s -p "API key for $name: " key; printf '\n'; fi
+  [[ -n "$key" ]] || die "API key is empty"
+  backup="$(backup_active)"
+  write_api_config "$base_url"
+  rm -f "$CODEX_HOME_DIR/auth.json"
+  if printf '%s\n' "$key" | codex login --with-api-key; then
+    unset key
+    save_profile "$name"
+    sync_or_restore "$backup"
+    printf "Saved and activated API profile '%s'.\n" "$name"
+  else
+    unset key
+    restore_active "$backup"
+    die "API login failed; restored the previous state from $backup"
+  fi
+}
+
+main() {
+  mkdir -p -m 700 "$PROFILES_DIR" "$BACKUPS_DIR" "$CODEX_HOME_DIR"
+  exec 9>"$LOCK_FILE"
+  command -v flock >/dev/null 2>&1 && flock -n 9 || die "another codex-switch command is running"
+  local command="${1:-help}"
+  case "$command" in
+    help|-h|--help) usage ;;
+    list) find "$PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort ;;
+    status)
+      require_codex
+      printf 'Active profile: %s\n' "$(active_profile_status)"
+      printf 'Authentication mode: %s\n' "$(auth_mode "$CODEX_HOME_DIR/auth.json")"
+      if service_url_for_paths "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json" >/dev/null; then printf 'Service URL fingerprint: %s\n' "$(url_fingerprint "$(service_url_for_paths "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json")")"; else printf 'Service URL fingerprint: unknown\n'; fi
+      codex login status
+      printf 'Shared conversations: %s (%s/sessions)\n' "$(shared_session_count)" "$CODEX_HOME_DIR"
+      ;;
+    save) [[ $# -eq 2 ]] || die "usage: codex-switch save <profile>"; save_profile "$2"; printf "Saved current Codex state as '%s'.\n" "$2" ;;
+    use)
+      [[ $# -ge 2 ]] || die "usage: codex-switch use <profile> [--resume [SESSION_ID]] [--no-reload-vscode]"
+      local profile="$2" session_id="" resume=false reload=true
+      shift 2
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --resume) [[ "$resume" == false ]] || die "--resume may only be specified once"; resume=true; if [[ -n "${2:-}" && "$2" != --* ]]; then session_id="$2"; shift 2; else session_id=--last; shift; fi ;;
+          --no-reload-vscode) reload=false; shift ;;
+          *) die "unknown option: $1" ;;
+        esac
+      done
+      use_profile "$profile"
+      reload_vscode_if_requested "$reload"
+      if [[ "$resume" == true ]]; then
+        resume_shared_session "$session_id"
+      fi
+      ;;
+    login)
+      [[ $# -ge 2 ]] || die "usage: codex-switch login <profile> [--clean] [--no-reload-vscode]"
+      require_codex
+      local profile="$2" clean="" reload=true
+      shift 2
+      while [[ $# -gt 0 ]]; do case "$1" in --clean) [[ -z "$clean" ]] || die "--clean may only be specified once"; clean=--clean ;; --no-reload-vscode) reload=false ;; *) die "unknown option: $1" ;; esac; shift; done
+      login_account "$profile" "$clean"
+      reload_vscode_if_requested "$reload"
+      ;;
+    api)
+      [[ $# -ge 2 ]] || die "usage: codex-switch api <profile> [--url API_BASE_URL] [--key-env ENV_VAR] [--no-reload-vscode]"
+      require_codex
+      shift
+      local reload=true api_args=()
+      while [[ $# -gt 0 ]]; do if [[ "$1" == --no-reload-vscode ]]; then reload=false; else api_args+=("$1"); fi; shift; done
+      login_api "${api_args[@]}"
+      reload_vscode_if_requested "$reload"
+      ;;
+    resume) [[ $# -le 3 ]] || die "usage: codex-switch resume [SESSION_ID|--last] [PROMPT]"; resume_shared_session "${2:-}" "${3:-}" ;;
+    *) die "unknown command '$command' (run: codex-switch help)" ;;
+  esac
+}
+
+main "$@"
